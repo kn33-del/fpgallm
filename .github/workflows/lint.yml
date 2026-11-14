@@ -1,0 +1,9 @@
+name: lint
+on: [push, pull_request]
+jobs:
+  verilator:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y verilator
+      - run: make lint 2>&1 | tee lint.txt; ! grep -q "%Error" lint.txt

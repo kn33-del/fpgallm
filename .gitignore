@@ -1,0 +1,25 @@
+# Vivado generated -- never commit, regenerate with `make project`
+build/
+.Xil/
+*.jou
+*.log
+*.str
+*.backup.*
+vivado*.zip
+xsim.dir/
+*.wdb
+*.pb
+*.wcfg.bak
+webtalk*
+usage_statistics_webtalk.*
+# Vitis
+_x/
+*.xo
+*.xclbin
+*.ltx
+# Verilator
+obj_dir/
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
