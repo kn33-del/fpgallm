@@ -117,6 +117,7 @@ package llm_pkg;
     addr_t       c_base;     // output (ACT/SCRATCH)
     logic [15:0] m, k, n;
     logic        b_is_kv;    // B from KV cache: n/k not multiples of 32 -> T1 must handle ragged edge
+    logic [31:0] b_row_stride; // 0 = packed B; otherwise byte stride between N tiles (e.g. V cache)
     mm_out_e     out_fmt;
     logic [3:0]  tag;        // [3:2] = master id (set by mm_arb), [1:0] = master's own tag
   } mm_cmd_t;

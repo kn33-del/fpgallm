@@ -480,7 +480,8 @@ module mm_ctrl import llm_pkg::*; #(
     b_rd.req.base = q.b_base;
     b_rd.req.row_beats = k_tiles;
     b_rd.req.n_rows = n_tiles;
-    b_rd.req.row_stride = 32'(k_tiles) * TILE_BYTES;
+    b_rd.req.row_stride = (q.b_row_stride == 0)
+                        ? 32'(k_tiles) * TILE_BYTES : q.b_row_stride;
     b_rd.req_valid = (state != IDLE) && !b_requested;
     s_rd.req = '0;
     s_rd.req.base = q.s_base;
