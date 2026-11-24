@@ -224,25 +224,31 @@ module mm_accum import llm_pkg::*; #(
   input logic out_ready
 );
   localparam int MW = (M_MAX > 1) ? $clog2(M_MAX) : 1;
-  (* ram_style = "block" *) logic [C-1:0][ACC_W-1:0] rows [M_MAX];
-  logic [C-1:0][ACC_W-1:0] rd_data, stage_psum, stage_sum;
-  logic stage_valid, stage_clear, stage_last;
+  // Flat word per row: a 2-D packed element ([C][ACC_W]) is a "3D RAM" to Vivado, which then
+  // builds the whole array (C*ACC_W*M_MAX bits) out of flip-flops.
+  (* ram_style = "block" *) logic [C*ACC_W-1:0] rows [M_MAX];
+  logic [C*ACC_W-1:0] ram_q;
+  logic [C-1:0][ACC_W-1:0] rd_data, fwd_q, stage_psum, stage_sum;
+  logic stage_valid, stage_clear, stage_last, fwd_sel;
   logic [15:0] stage_m;
   assign in_ready = !out_valid || out_ready;
   for (genvar c = 0; c < C; c++) begin : g_sum
     assign stage_sum[c] = stage_clear ? stage_psum[c] : rd_data[c] + stage_psum[c];
   end
-  // Keep RAM read/write outside the reset branch for synchronous BRAM inference.
+  // Keep the RAM port in the plain "q <= mem[addr]" form so it maps to BRAM/URAM:
+  // any extra mux on ram_q (clear / forwarding) makes Vivado build 2 Mb of flip-flops.
+  // Forwarding (same row written by the stage this cycle) is selected after the RAM.
   always_ff @(posedge clk) begin
     if (rst_n && in_ready) begin
       if (stage_valid) rows[MW'(stage_m)] <= stage_sum;
-      if (psum_valid) begin
-        if (clear) rd_data <= '0;
-        else if (stage_valid && stage_m == m_idx) rd_data <= stage_sum;
-        else rd_data <= rows[MW'(m_idx)];
-      end
+      if (psum_valid) ram_q <= rows[MW'(m_idx)];
     end
   end
+  always_ff @(posedge clk) begin
+    if (rst_n && in_ready && psum_valid) fwd_q <= stage_sum;
+  end
+  // A cleared row ignores rd_data entirely (stage_sum selects stage_psum on stage_clear).
+  assign rd_data = fwd_sel ? fwd_q : ram_q;
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       stage_valid <= 1'b0;
@@ -250,6 +256,7 @@ module mm_accum import llm_pkg::*; #(
       stage_last <= 1'b0;
       stage_m <= '0;
       stage_psum <= '0;
+      fwd_sel <= 1'b0;
       out <= '0;
       out_m_idx <= '0;
       out_valid <= 1'b0;
@@ -260,6 +267,7 @@ module mm_accum import llm_pkg::*; #(
         stage_clear <= clear;
         stage_last <= last;
         stage_m <= m_idx;
+        fwd_sel <= stage_valid && stage_m == m_idx;
       end
       out_valid <= stage_valid && stage_last;
       if (stage_valid && stage_last) begin

@@ -42,24 +42,58 @@ def i16(x):
     return np.clip(np.rint(x), -32768, 32767).astype(np.int64)
 
 
+def smooth_factors(amax, W_cols_max, alpha=0.5):
+    """SmoothQuant: per-input-channel a_j; activation_j /= a_j, weight column j *= a_j."""
+    if alpha is None:
+        return np.ones_like(np.asarray(amax, np.float64))
+    a = np.power(np.maximum(amax, 1e-6), alpha) / np.power(np.maximum(W_cols_max, 1e-6), 1 - alpha)
+    return np.clip(a, 1e-3, 1e3)
+
+
 class QuantLlama(TinyModel):
-    def __init__(self, fm, probes, qshift=8, log=print):
+    # Defaults chosen by sweep (scripts/quant_debug.py): logits cos ~0.98 vs fp32, top-4 agree.
+    def __init__(self, fm, probes, qshift=8, alpha=0.65, xclip_pct=None, gamma_target=30000, qm=8000,
+                 smooth_u=True, log=print):
         assert cfg.MODEL == "tinyllama" and cfg.D_MODEL == fm.D and cfg.N_LAYERS == fm.L
         L, D, F, H, KVH, HD = fm.L, fm.D, fm.F, fm.H, fm.KVH, fm.HD
         G = H // KVH
         P = probes
+        ch = lambda k: np.asarray(P["ch:" + k], np.float64)
         self.mm_shift = S = cfg.T1_SHIFT
         self.theta = fm.theta
         self.stats = {}
-        s_x = P["x"] * 1.05 / 32767.0
+        # ---- residual: percentile clip (rare massive activations saturate instead of costing bits)
+        xclip = (float(np.percentile(P["x_tok"], xclip_pct)) * 1.25 if xclip_pct is not None
+                 else P["x"] * 1.05)
+        s_x = xclip / 32767.0
         self.s_x = s_x
         self.s_k, self.s_v = [], []
-        # ---- global SiLU*up scale: QM chosen so the median layer needs c_l ~ 1
-        s_u_want = np.array([P[f"u{l}"] / 127.0 for l in range(L)])
+        fold = {}                                       # SmoothQuant-folded float weights per layer
+        for l in range(L):
+            p = f"model.layers.{l}."
+            Wq, Wk, Wv = (fm.w(p + f"self_attn.{n}_proj.weight") for n in "qkv")
+            Wg, Wu, Wd = (fm.w(p + f"mlp.{n}_proj.weight") for n in ("gate", "up", "down"))
+            a1 = smooth_factors(ch(f"h{l}"), np.maximum.reduce([np.abs(W).max(0) for W in (Wq, Wk, Wv)]), alpha)
+            a2 = smooth_factors(ch(f"h2_{l}"), np.maximum(np.abs(Wg).max(0), np.abs(Wu).max(0)), alpha)
+            a3 = smooth_factors(ch(f"u{l}"), np.abs(Wd).max(0), alpha if smooth_u else None)
+            fold[l] = dict(a1=a1, a2=a2, a3=a3,
+                           g1=fm.small(p + "input_layernorm.weight") / a1,
+                           g2=fm.small(p + "post_attention_layernorm.weight") / a2,
+                           s_h=float(np.max(ch(f"h{l}") / a1)) / 127.0,
+                           s_h2=float(np.max(ch(f"h2_{l}") / a2)) / 127.0,
+                           s_u=float(np.max(ch(f"u{l}") / a3)) / 127.0,
+                           up_ok=float(np.min(0.95 * 128.0 * a3 / np.maximum(ch(f"up{l}"), 1e-9))))
+        s_hf = P["hf"] / 127.0
+        gf = fm.small("model.norm.weight")
+        # ---- one global QUANT_MULT: the largest folded gamma lands at ~gamma_target codes
+        need = max([float(np.max(np.abs(f["g1"]))) / f["s_h"] for f in fold.values()] +
+                   [float(np.max(np.abs(f["g2"]))) / f["s_h2"] for f in fold.values()] +
+                   [float(np.max(np.abs(gf))) / s_hf])
         self.qs = qshift
-        self.qm = int(max(1, round((1 << qshift) / float(np.median(s_u_want)))))
+        self.qm = int(qm) if qm else int(max(1, np.floor(need * 256.0 * (1 << qshift) / gamma_target)))
         base_su = (1 << qshift) / self.qm
-        log(f"[quant] s_x={s_x:.4g} (|x|max={P['x']:.1f})  QUANT_MULT={self.qm} QUANT_SHIFT={self.qs}")
+        log(f"[quant] s_x={s_x:.4g} (clip {xclip:.1f}, max seen {P['x']:.1f})  "
+            f"QUANT_MULT={self.qm} QUANT_SHIFT={self.qs}  alpha={alpha}")
 
         def gamma(w, s_h):
             return i16(w * 256.0 * (1 << self.qs) / (self.qm * s_h))
@@ -72,17 +106,18 @@ class QuantLlama(TinyModel):
         self._gu = []
         for l in range(L):
             p = f"model.layers.{l}."
-            s_h, s_h2 = P[f"h{l}"] / 127.0, P[f"h2_{l}"] / 127.0
-            self.g_attn.append(gamma(fm.small(p + "input_layernorm.weight"), s_h))
-            self.g_mlp.append(gamma(fm.small(p + "post_attention_layernorm.weight"), s_h2))
+            f = fold[l]
+            s_h, s_h2 = f["s_h"], f["s_h2"]
+            self.g_attn.append(gamma(f["g1"], s_h))
+            self.g_mlp.append(gamma(f["g2"], s_h2))
             s_q = [P[f"q{l}.{g}"] / 127.0 for g in range(KVH)]
             s_k = [P[f"k{l}.{g}"] / 127.0 for g in range(KVH)]
             s_v = [P[f"v{l}.{g}"] / 127.0 for g in range(KVH)]
             self.s_k.append(s_k)
             self.s_v.append(s_v)
-            Wq, sq = q8_per_out(fm.w(p + "self_attn.q_proj.weight"))
-            Wk, sk = q8_per_out(fm.w(p + "self_attn.k_proj.weight"))
-            Wv, sv = q8_per_out(fm.w(p + "self_attn.v_proj.weight"))
+            Wq, sq = q8_per_out(fm.w(p + "self_attn.q_proj.weight") * f["a1"])
+            Wk, sk = q8_per_out(fm.w(p + "self_attn.k_proj.weight") * f["a1"])
+            Wv, sv = q8_per_out(fm.w(p + "self_attn.v_proj.weight") * f["a1"])
             grp = np.concatenate([np.repeat([s_q[hh // G] for hh in range(H)], HD),
                                   np.repeat(s_k, HD), np.repeat(s_v, HD)])
             self.Wqkv.append(np.concatenate([Wq, Wk, Wv], axis=1))
@@ -93,23 +128,23 @@ class QuantLlama(TinyModel):
             Wo, so = q8_per_out(fm.w(p + "self_attn.o_proj.weight"))
             self.Wo.append(Wo)
             self.s_wo.append(mult((1 << S) * s_head * so / s_x))
-            # ---- MLP with per-layer up-scale factor c_l
-            c_l = min(base_su / s_u_want[l], 0.95 * 128.0 / max(P[f"up{l}"], 1e-9))
+            # ---- MLP: u_j /= a3_j (per-channel up multiplier), Wd column j *= a3_j;
+            #      per-layer factor c_l maps the global QUANT_MULT onto this layer's u scale.
+            c_l = min(base_su / f["s_u"], f["up_ok"])
             s_u = base_su / c_l
-            Wg, sgw = q8_per_out(fm.w(p + "mlp.gate_proj.weight"))
-            Wu, suw = q8_per_out(fm.w(p + "mlp.up_proj.weight"))
-            Wd, sdw = q8_per_out(fm.w(p + "mlp.down_proj.weight"))
+            Wg, sgw = q8_per_out(fm.w(p + "mlp.gate_proj.weight") * f["a2"])
+            Wu, suw = q8_per_out(fm.w(p + "mlp.up_proj.weight") * f["a2"])
+            Wd, sdw = q8_per_out(fm.w(p + "mlp.down_proj.weight") * f["a3"])
             self.Wg.append(Wg)
             self.Wu.append(Wu)
             self.sg.append(mult((1 << (S + 8)) * s_h2 * sgw))
-            self.su.append(mult((1 << (S + 8)) * s_h2 * suw * c_l))
+            self.su.append(mult((1 << (S + 8)) * s_h2 * suw * c_l / f["a3"]))
             self.Wd.append(Wd)
             self.sd.append(mult((1 << S) * s_u * sdw / s_x))
             self._gu.append(TinyModel.gu(self, l))
-            self.stats[l] = dict(c_l=round(c_l, 3), s_u=s_u, u_max=P[f"u{l}"], gate_max=P[f"gate{l}"],
-                                 up_max=P[f"up{l}"], score_max=P[f"score{l}"])
-        s_hf = P["hf"] / 127.0
-        self.g_final = gamma(fm.small("model.norm.weight"), s_hf)
+            self.stats[l] = dict(c_l=round(c_l, 3), s_u=s_u, s_u_want=f["s_u"], up_limited=c_l < base_su / f["s_u"],
+                                 gmin1=int(np.abs(self.g_attn[-1]).min()), gmax1=int(np.abs(self.g_attn[-1]).max()))
+        self.g_final = gamma(gf, s_hf)
         Wl, sl = q8_per_out(fm.w("lm_head.weight"))
         s_lg = P["logits"] * 1.1 / 32767.0
         self.Wlm, self.s_lm = Wl, mult((1 << S) * s_hf * sl / s_lg)
@@ -119,6 +154,9 @@ class QuantLlama(TinyModel):
             sat = sum(int(np.sum(np.abs(g) >= 32767)) for g in getattr(self, name))
             if sat:
                 log(f"[quant] WARNING {sat} saturated {name} gamma codes")
+        lim = [l for l in range(L) if self.stats[l]["up_limited"]]
+        if lim:
+            log(f"[quant] layers whose u scale is limited by up-proj int16 range: {lim}")
 
     def gu(self, l):
         return self._gu[l]
@@ -177,4 +215,4 @@ def calibrate(fm, tok, prompts, n_new=24, log=print):
         out = fm.generate(ids, n_new, stop=tok.eos)
         log(f"[calib] {pr!r} -> {tok.decode(out)!r}")
     P, fm.probes = fm.probes, None
-    return P
+    return {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in P.items()}

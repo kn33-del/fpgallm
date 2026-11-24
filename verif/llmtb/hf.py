@@ -168,6 +168,13 @@ class FloatLlama:
             return
         v = float(np.max(np.abs(x)))
         self.probes[name] = max(self.probes.get(name, 0.0), v)
+        if per is not None:                       # per-channel running max (SmoothQuant stats)
+            a = np.abs(np.asarray(x, np.float64)).reshape(-1)
+            key = "ch:" + name
+            old = self.probes.get(key)
+            self.probes[key] = a if old is None else np.maximum(np.asarray(old), a)
+        if name == "x":
+            self.probes.setdefault("x_tok", []).append(v)
 
     def rms(self, x, w):
         return x / np.sqrt(np.mean(x * x) + self.eps) * w
@@ -186,7 +193,7 @@ class FloatLlama:
         for l in range(self.L):
             p = f"model.layers.{l}."
             h = self.rms(x, self.small(p + "input_layernorm.weight"))
-            self.probe(f"h{l}", h)
+            self.probe(f"h{l}", h, per=True)
             q = (self.w(p + "self_attn.q_proj.weight") @ h).reshape(H, HD)
             k = (self.w(p + "self_attn.k_proj.weight") @ h).reshape(KVH, HD)
             v = (self.w(p + "self_attn.v_proj.weight") @ h).reshape(KVH, HD)
@@ -205,18 +212,18 @@ class FloatLlama:
                 self.probe(f"score{l}", sc)
                 e = np.exp(sc - sc.max())
                 o[hh] = (e / e.sum()) @ Vl[g]
-            self.probe(f"head{l}", o)
+            self.probe(f"head{l}", o, per=True)
             a = self.w(p + "self_attn.o_proj.weight") @ o.reshape(-1)
             x = x + a
             self.probe("x", x)
             h = self.rms(x, self.small(p + "post_attention_layernorm.weight"))
-            self.probe(f"h2_{l}", h)
+            self.probe(f"h2_{l}", h, per=True)
             gt = self.w(p + "mlp.gate_proj.weight") @ h
             up = self.w(p + "mlp.up_proj.weight") @ h
             self.probe(f"gate{l}", gt)
-            self.probe(f"up{l}", up)
+            self.probe(f"up{l}", up, per=True)
             u = gt / (1 + np.exp(-gt)) * up
-            self.probe(f"u{l}", u)
+            self.probe(f"u{l}", u, per=True)
             x = x + self.w(p + "mlp.down_proj.weight") @ u
             self.probe("x", x)
             if self.trace is not None:

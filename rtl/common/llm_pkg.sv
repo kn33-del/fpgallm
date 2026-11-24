@@ -58,7 +58,7 @@ package llm_pkg;
   // 16 bits so small per-channel multipliers keep precision (quantizer derives mult from this).
 `ifdef LLM_TINYLLAMA
   parameter int T1_REQUANT_SHIFT = 28;
-  parameter int T3_QUANT_MULT  = 1;    // TODO(quantizer): fill from calibration
+  parameter int T3_QUANT_MULT  = 8000; // QuantLlama default qm (verif/llmtb/quantize.py)
   parameter int T3_QUANT_SHIFT = 8;
 `else
   parameter int T1_REQUANT_SHIFT = 16;

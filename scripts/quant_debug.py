@@ -13,7 +13,8 @@ M = str(ROOT.parent / "TinyLlama-1.1B-Chat-v1.0")
 tok = Tokenizer(M + "/tokenizer.json")
 fm = FloatLlama(M)
 P = json.loads((ROOT / "build/tinyllama_calib.json").read_text())
-qm = QuantLlama(fm, P, log=lambda *a: None)
+kw = json.loads(os.environ.get("QARGS", "{}"))
+qm = QuantLlama(fm, P, **kw)
 s_x = qm.s_x
 ids = tok.chat(sys.argv[1] if len(sys.argv) > 1 else "What is an FPGA? Answer in one sentence.")
 n = int(os.environ.get("NTOK", "8"))
@@ -25,7 +26,7 @@ for pos, t in list(enumerate(ids[:n]))[1:]:
     lf = fm.step(t, pos)
     r = qm.step(t, pos)
 print(f"after {n} prompt tokens (pos {n-1}):")
-for l in range(fm.L):
+for l in [0, 1, 2, 6, 7, 8, 14, 21]:
     xf, xq = fm.trace[f"x_l{l}"], r[f"x_l{l}"] * s_x
     rel = np.linalg.norm(xq - xf) / np.linalg.norm(xf)
     cos = float(xq @ xf / (np.linalg.norm(xq) * np.linalg.norm(xf)))
