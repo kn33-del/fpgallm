@@ -16,15 +16,15 @@ package t2_attn_pkg;
                                  + PROB_BYTES + D_MODEL * DATA_W / 8;
   localparam int COEFF_BYTES = HEAD_DIM * 16 / 8;
   localparam int TILE_BYTES = ARR_R * ARR_C * DATA_W / 8;
+  // Wide (B-operand) addresses are PER-PC bytes per the llm_pkg contract: one tile = 32 B in
+  // each of the N_HBM pseudo-channels.
+  localparam int TILE_PC_BYTES = TILE_BYTES / N_HBM;
   localparam int WO_OFFSET = ((D_MODEL + ARR_R-1) / ARR_R)
-                             * ((QKV_ELEMENTS + ARR_C-1) / ARR_C) * TILE_BYTES;
+                             * ((QKV_ELEMENTS + ARR_C-1) / ARR_C) * TILE_PC_BYTES;
   localparam int SCALE_TILE_BYTES = ((ARR_C*SCALE_W + BEAT_W-1) / BEAT_W) * BEAT_BYTES;
   localparam int WO_SCALE_OFFSET = ((QKV_ELEMENTS + ARR_C-1) / ARR_C) * SCALE_TILE_BYTES;
-  localparam int K_CACHE_BYTES = ((HEAD_DIM + ARR_R-1) / ARR_R)
-                                 * ((MAX_SEQ + ARR_C-1) / ARR_C) * TILE_BYTES;
-  localparam int V_N_TILE_STRIDE = ((MAX_SEQ + ARR_R-1) / ARR_R) * TILE_BYTES;
-  localparam int V_CACHE_BYTES = ((HEAD_DIM + ARR_C-1) / ARR_C) * V_N_TILE_STRIDE;
-  localparam int KV_BYTES = K_CACHE_BYTES + V_CACHE_BYTES;
+  // V cache: per-PC stride between its N tiles (k_tiles = MAX_SEQ/32 tiles each).
+  localparam int V_N_TILE_STRIDE = ((MAX_SEQ + ARR_R-1) / ARR_R) * TILE_PC_BYTES;
   localparam int K_SCALE_BYTES = ((MAX_SEQ + ARR_C-1) / ARR_C) * SCALE_TILE_BYTES;
   localparam int V_SCALE_BYTES = ((HEAD_DIM + ARR_C-1) / ARR_C) * SCALE_TILE_BYTES;
   localparam int KV_SCALE_BYTES = K_SCALE_BYTES + V_SCALE_BYTES;
@@ -50,7 +50,7 @@ module attn_unit
   import t2_attn_pkg::*;
 #(
   parameter logic [AXI_AW-1:0] SCRATCH_BASE   = '0,
-  parameter logic [AXI_AW-1:0] KV_BASE        = 34'h080000000,
+  // KV cache placement is fixed by llm_pkg::kv_pc_off (T4 kv_cache_mgr writes it there).
   parameter logic [AXI_AW-1:0] KV_SCALE_BASE  = 34'h084000000,
   parameter logic [AXI_AW-1:0] ROPE_BASE      = 34'h085000000
 )(
@@ -75,7 +75,7 @@ module attn_unit
   mem_wr_if rope_wr(), sm_wr();
 
   attn_seq #(.QKV_VEC(QKV_VEC), .QKV_I8(QKV_I8), .SCORES(SCORES),
-             .PROBS(PROBS), .HEADS(HEADS), .KV_BASE(KV_BASE),
+             .PROBS(PROBS), .HEADS(HEADS),
              .KV_SCALE_BASE(KV_SCALE_BASE)) u_seq (
     .clk, .rst_n, .cmd, .cmd_valid, .cmd_ready, .done, .mm,
     .token_pos, .rope_start, .rope_done, .sm_start, .sm_done,
@@ -163,7 +163,6 @@ module attn_unit
             && COEFF_BYTES % BEAT_BYTES == 0)
       else $fatal(1, "Attention requires beat-aligned heads and T1 tiles");
     assert (SCRATCH_BASE % AXI_AW'(BEAT_BYTES) == 0
-            && KV_BASE % AXI_AW'(TILE_BYTES) == 0
             && KV_SCALE_BASE % AXI_AW'(BEAT_BYTES) == 0
             && ROPE_BASE % AXI_AW'(BEAT_BYTES) == 0)
       else $fatal(1, "Unaligned attention memory base");
@@ -176,7 +175,7 @@ module attn_seq
   import t2_attn_pkg::*;
 #(
   parameter addr_t QKV_VEC = '0, QKV_I8 = '0, SCORES = '0, PROBS = '0, HEADS = '0,
-  parameter logic [AXI_AW-1:0] KV_BASE = '0, KV_SCALE_BASE = '0
+  parameter logic [AXI_AW-1:0] KV_SCALE_BASE = '0
 )(
   input logic clk, rst_n,
   input attn_cmd_t cmd,
@@ -205,8 +204,10 @@ module attn_seq
   logic [KV_BEAT_W-1:0] kv_beat;
   logic [KV_BEATS*BEAT_W-1:0] kv_payload;
   logic kv_committed;
+  logic kv_is_v;           // append phase: 0 = K vector request, 1 = V vector request
   int unsigned cache_head, pair_index;
   addr_t k_cache, v_cache, k_scales, v_scales;
+  kv_tag_t kv_tag;
 
   assign cmd_ready = (state == IDLE);
   assign done = (state == FINISH);
@@ -219,8 +220,8 @@ module attn_seq
     if (state == SCORE_MATMUL || state == VALUE_MATMUL)
       cache_head = int'(head) / (N_HEADS / N_KV_HEADS);
     pair_index = int'(active.layer)*N_KV_HEADS + cache_head;
-    k_cache = '{rgn: RGN_HBM, off: KV_BASE + AXI_AW'(pair_index*KV_BYTES)};
-    v_cache = offset_addr(k_cache, K_CACHE_BYTES);
+    k_cache = '{rgn: RGN_HBM, off: AXI_AW'(kv_pc_off(active.layer, 4'(cache_head), 1'b0))};
+    v_cache = '{rgn: RGN_HBM, off: AXI_AW'(kv_pc_off(active.layer, 4'(cache_head), 1'b1))};
     k_scales = '{rgn: RGN_HBM,
                  off: KV_SCALE_BASE + AXI_AW'(pair_index*KV_SCALE_BYTES)};
     v_scales = offset_addr(k_scales, K_SCALE_BYTES);
@@ -291,12 +292,14 @@ module attn_seq
     kv_src.req_valid = (state == KV_READ_REQ);
     kv_src.ready = (state == KV_READ);
 
-    // Logical token slot metadata. T4 scatters the payload into K^T and V.
-    kv.req = linear_req(offset_addr(k_cache, int'(active.pos)*HEAD_BYTES), KV_BEATS);
+    // llm_pkg KV contract: one request per vector; base.off[28:0] carries kv_tag_t and T4
+    // scatters the HEAD_BEATS-beat payload into the K^T (column) or V (row) tiles.
+    kv_tag = '{layer: active.layer, kvh: 4'(head), is_v: kv_is_v, pos: active.pos};
+    kv.req = linear_req('{rgn: RGN_HBM, off: AXI_AW'(kv_tag)}, HEAD_BEATS);
     kv.req_valid = (state == KV_WRITE_REQ);
-    kv.data = kv_payload[int'(kv_beat)*BEAT_W +: BEAT_W];
+    kv.data = kv_payload[(int'(kv_is_v)*HEAD_BEATS + int'(kv_beat))*BEAT_W +: BEAT_W];
     kv.valid = (state == KV_WRITE);
-    kv.last = kv.valid && (int'(kv_beat) == KV_BEATS-1);
+    kv.last = kv.valid && (int'(kv_beat) == HEAD_BEATS-1);
   end
 
   always_ff @(posedge clk or negedge rst_n) begin
@@ -307,6 +310,7 @@ module attn_seq
       kv_beat <= '0;
       kv_payload <= '0;
       kv_committed <= 1'b0;
+      kv_is_v <= 1'b0;
     end else begin
       case (state)
         IDLE: if (cmd_valid && cmd_ready) begin
@@ -325,7 +329,10 @@ module attn_seq
         KV_READ: if (kv_src.valid) begin
           kv_payload[int'(kv_beat)*BEAT_W +: BEAT_W] <= kv_src.data;
           kv_beat <= kv_beat + 1'b1;
-          if (kv_src.last) state <= KV_WRITE_REQ;
+          if (kv_src.last) begin
+            kv_is_v <= 1'b0;
+            state <= KV_WRITE_REQ;
+          end
         end
         KV_WRITE_REQ: if (kv.req_ready) begin
           kv_beat <= '0;
@@ -338,7 +345,11 @@ module attn_seq
           end else kv_beat <= kv_beat + 1'b1;
         end
         KV_COMMIT: if (kv.done || kv_committed) begin
-          if (int'(head) == N_KV_HEADS-1) begin
+          if (!kv_is_v) begin                    // K committed -> append V for this head
+            kv_is_v <= 1'b1;
+            kv_committed <= 1'b0;
+            state <= KV_WRITE_REQ;
+          end else if (int'(head) == N_KV_HEADS-1) begin
             head <= '0;
             state <= SCORE_MATMUL;
           end else begin

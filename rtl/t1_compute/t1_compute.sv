@@ -480,8 +480,10 @@ module mm_ctrl import llm_pkg::*; #(
     b_rd.req.base = q.b_base;
     b_rd.req.row_beats = k_tiles;
     b_rd.req.n_rows = n_tiles;
+    // llm_pkg contract: B addresses/strides are PER-PC bytes (one tile = 32 B in each of the
+    // 32 PCs), so a packed n_tile row is k_tiles * 32 B.
     b_rd.req.row_stride = (q.b_row_stride == 0)
-                        ? 32'(k_tiles) * TILE_BYTES : q.b_row_stride;
+                        ? 32'(k_tiles) * (TILE_BYTES / N_HBM) : q.b_row_stride;
     b_rd.req_valid = (state != IDLE) && !b_requested;
     s_rd.req = '0;
     s_rd.req.base = q.s_base;

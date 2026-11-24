@@ -2,6 +2,8 @@
 # make gui      -> open it
 # make lint     -> verilator lint (same as CI)
 # make test-t2  -> simulate decode attention
+# make verif    -> pyuvm/cocotb regression: T1..T4 unit benches + full pipeline (see verif/README.md)
+#                  make verif BENCH="t1 t3"  /  make verif BENCH=top ARGS="-k TopDecode3Tokens"
 # make clean
 RTL := rtl/common/llm_pkg.sv rtl/common/llm_if.sv \
        $(filter-out rtl/common/llm_pkg.sv rtl/common/llm_if.sv,$(wildcard rtl/common/*.sv)) \
@@ -30,7 +32,10 @@ $(T2_TEST): $(T2_SOURCES)
 	verilator --binary --timing --assert -j 4 -Wno-TIMESCALEMOD \
 	  --Mdir $(@D) --top-module tb_t2_attention $^
 
+verif:
+	python3 verif/run.py $(BENCH) $(ARGS)
+
 clean:
 	rm -rf build .Xil obj_dir *.jou *.log
 
-.PHONY: project gui lint test-t2 clean
+.PHONY: project gui lint test-t2 verif clean

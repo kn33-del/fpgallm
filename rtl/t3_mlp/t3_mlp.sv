@@ -81,7 +81,9 @@ module mlp_seq import llm_pkg::*; #(
   // Reserve GU_BYTES + D_FF*(DATA_W/8) bytes at SCRATCH_BASE. Gate/up
   // tiles come first, then the quantized gated output. Gate/up scale arrays
   // precede Wd scales in the scale region.
-  localparam int WD_OFFSET = D_MODEL*2*D_FF*(DATA_W/8);
+  // Weight offsets are per-PC bytes (llm_pkg contract): packed [Wg|Wu] occupies
+  // D_MODEL*2*D_FF bytes spread over N_HBM pseudo-channels.
+  localparam int WD_OFFSET = D_MODEL*2*D_FF*(DATA_W/8) / N_HBM;
   localparam int SD_OFFSET = 2*D_FF*(SCALE_W/8);
   localparam int UP_OFFSET = ARR_C*(VEC_W/8);
   typedef enum logic [2:0] {S_IDLE, S_GU, S_GU_WAIT, S_VEC, S_VEC_WAIT,

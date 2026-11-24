@@ -42,7 +42,7 @@ module llm_top import llm_pkg::*; (
 
   // ---- 32x m_axi to HBM (one per PC). Wrapper flattens to m00_axi_*, m01_axi_*, ...
   //      Connectivity file (.cfg): sp=llm_top.m00_axi:HBM[0] ... m31_axi:HBM[31]
-  output logic [N_HBM-1:0][AXI_AW-1:0]  m_axi_araddr,
+  output logic [N_HBM-1:0][M_AXI_AW-1:0] m_axi_araddr,
   output logic [N_HBM-1:0][7:0]         m_axi_arlen,
   output logic [N_HBM-1:0][AXI_IDW-1:0] m_axi_arid,
   output logic [N_HBM-1:0]              m_axi_arvalid,
@@ -53,7 +53,7 @@ module llm_top import llm_pkg::*; (
   input  logic [N_HBM-1:0]              m_axi_rlast,
   input  logic [N_HBM-1:0]              m_axi_rvalid,
   output logic [N_HBM-1:0]              m_axi_rready,
-  output logic [N_HBM-1:0][AXI_AW-1:0]  m_axi_awaddr,
+  output logic [N_HBM-1:0][M_AXI_AW-1:0] m_axi_awaddr,
   output logic [N_HBM-1:0][7:0]         m_axi_awlen,
   output logic [N_HBM-1:0][AXI_IDW-1:0] m_axi_awid,
   output logic [N_HBM-1:0]              m_axi_awvalid,
@@ -79,7 +79,11 @@ module llm_top import llm_pkg::*; (
   logic        ap_start, ap_done;
   addr_t       instr_base;
   logic [15:0] n_instr, token_pos;
+  logic [31:0] token_in;
+  perf_t       perf;
   logic [31:0] result_token;
+  logic        perf_clr;
+  logic [N_HBM-1:0][63:0] hbm_base;
 
   // ===========================================================================
   // Sequencer -> unit command channels
@@ -118,7 +122,7 @@ module llm_top import llm_pkg::*; (
   llm_ctrl u_ctrl (
     .clk, .rst_n,
     .start (ap_start), .done (ap_done),
-    .instr_base, .n_instr, .token_pos, .result_token,
+    .instr_base, .n_instr, .token_pos, .token_in, .result_token,
     .ifetch (ifetch_rd.client),
     .mm     (mm_from_ctrl.master),
     .attn_cmd, .attn_cmd_valid, .attn_cmd_ready, .attn_done,
@@ -140,7 +144,7 @@ module llm_top import llm_pkg::*; (
   // ===========================================================================
   // TEAM 1 -- compute
   // ===========================================================================
-  mm_engine u_mm (
+  mm_engine #(.REQUANT_SHIFT(T1_REQUANT_SHIFT)) u_mm (
     .clk, .rst_n,
     .cmd  (mm_to_engine.slave),
     .a_rd (mm_a_rd.client),
@@ -164,7 +168,7 @@ module llm_top import llm_pkg::*; (
   // ===========================================================================
   // TEAM 3 -- MLP + vector/numerical units
   // ===========================================================================
-  mlp_unit u_mlp (
+  mlp_unit #(.QUANT_MULT(SCALE_W'(T3_QUANT_MULT)), .QUANT_SHIFT(T3_QUANT_SHIFT)) u_mlp (
     .clk, .rst_n,
     .mlp_cmd, .mlp_cmd_valid, .mlp_cmd_ready, .mlp_done,
     .vec_cmd, .vec_cmd_valid, .vec_cmd_ready, .vec_done, .argmax_idx,
@@ -184,11 +188,13 @@ module llm_top import llm_pkg::*; (
     .bready (s_axi_control_bready), .araddr (s_axi_control_araddr), .arvalid (s_axi_control_arvalid),
     .arready(s_axi_control_arready), .rdata (s_axi_control_rdata), .rresp (s_axi_control_rresp),
     .rvalid (s_axi_control_rvalid), .rready (s_axi_control_rready), .interrupt,
-    .ap_start, .ap_done, .instr_base, .n_instr, .token_pos, .result_token
+    .ap_start, .ap_done, .instr_base, .n_instr, .token_pos, .token_in, .result_token,
+    .perf, .perf_clr, .hbm_base
   );
 
   mem_subsys u_mem (
     .clk, .rst_n,
+    .perf, .perf_clr, .hbm_base,
     .dma_cmd, .dma_cmd_valid, .dma_cmd_ready, .dma_done,
     .ifetch_rd (ifetch_rd.server),
     .mm_a_rd   (mm_a_rd.server),
@@ -218,10 +224,67 @@ module mm_arb import llm_pkg::*; (
   mm_if.slave  m0, m1, m2,
   mm_if.master s
 );
-  // TODO:
   //  - round-robin grant among {m0,m1,m2} cmd_valid
   //  - s.cmd = granted cmd with tag[3:2] = master index
   //  - s.cmd_valid/ready pass-through for granted master; others see cmd_ready=0
   //  - on s.done: route to master s.done_tag[3:2], give it done_tag with [3:2] cleared
-  //  - baseline: allow only one outstanding cmd total (T1 engine is single-issue)
+  //  - baseline: only one outstanding cmd total (T1 engine is single-issue)
+  //  - grant is locked while s.cmd_valid && !s.cmd_ready (payload stable per llm_if rules)
+  logic [2:0] req;
+  logic [1:0] last_gnt, gnt, gnt_q;
+  logic       gnt_v, busy, lock;
+  mm_cmd_t    sel;
+
+  assign req = {m2.cmd_valid, m1.cmd_valid, m0.cmd_valid};
+
+  always_comb begin
+    gnt   = gnt_q;
+    gnt_v = lock;
+    if (!lock) begin
+      for (int i = 3; i >= 1; i--) begin          // first requester after last_gnt wins
+        automatic int c = (int'(last_gnt) + i) % 3;
+        if (req[c]) begin gnt = 2'(c); gnt_v = 1'b1; end
+      end
+    end
+    case (gnt)
+      2'd1:    sel = m1.cmd;
+      2'd2:    sel = m2.cmd;
+      default: sel = m0.cmd;
+    endcase
+    sel.tag[3:2] = gnt;
+  end
+
+  assign s.cmd       = sel;
+  assign s.cmd_valid = !busy && gnt_v;
+  assign m0.cmd_ready = !busy && gnt_v && gnt == 2'd0 && s.cmd_ready;
+  assign m1.cmd_ready = !busy && gnt_v && gnt == 2'd1 && s.cmd_ready;
+  assign m2.cmd_ready = !busy && gnt_v && gnt == 2'd2 && s.cmd_ready;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      busy <= 1'b0; lock <= 1'b0; last_gnt <= 2'd2; gnt_q <= '0;
+    end else begin
+      lock  <= s.cmd_valid && !s.cmd_ready;
+      gnt_q <= gnt;
+      if (s.cmd_valid && s.cmd_ready) begin
+        busy     <= 1'b1;
+        last_gnt <= gnt;
+      end
+      if (s.done) busy <= 1'b0;
+    end
+  end
+
+  always_comb begin
+    m0.done = s.done && s.done_tag[3:2] == 2'd0;
+    m1.done = s.done && s.done_tag[3:2] == 2'd1;
+    m2.done = s.done && s.done_tag[3:2] == 2'd2;
+    m0.done_tag = {2'b00, s.done_tag[1:0]};
+    m1.done_tag = {2'b00, s.done_tag[1:0]};
+    m2.done_tag = {2'b00, s.done_tag[1:0]};
+  end
+
+`ifndef SYNTHESIS
+  always_ff @(posedge clk) if (rst_n && s.done)
+    assert (busy && s.done_tag[3:2] != 2'd3) else $error("mm_arb: unexpected done (tag %h)", s.done_tag);
+`endif
 endmodule

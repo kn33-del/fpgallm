@@ -3,7 +3,6 @@ module tb_t2_attention;
   import llm_pkg::*;
   import t2_attn_pkg::*;
 
-  localparam logic [AXI_AW-1:0] KV_BASE = AXI_AW'('h2000000);
   localparam logic [AXI_AW-1:0] KV_SCALE_BASE = AXI_AW'('h5000000);
   localparam logic [AXI_AW-1:0] ROPE_BASE = AXI_AW'('h6000000);
   localparam int QKV_I8_OFF = QKV_VEC_BYTES;
@@ -23,7 +22,7 @@ module tb_t2_attention;
   mm_if mm();
   mem_rd_if rd();
   mem_wr_if wr(), kv();
-  attn_unit #(.KV_BASE(KV_BASE), .KV_SCALE_BASE(KV_SCALE_BASE), .ROPE_BASE(ROPE_BASE)) dut (
+  attn_unit #(.KV_SCALE_BASE(KV_SCALE_BASE), .ROPE_BASE(ROPE_BASE)) dut (
     .clk, .rst_n, .cmd, .cmd_valid, .cmd_ready, .done, .mm, .rd, .wr, .kv
   );
 
@@ -31,7 +30,8 @@ module tb_t2_attention;
   logic signed [15:0] cosines [HEAD_DIM/2], sines [HEAD_DIM/2];
   mem_req_t read_req, write_req;
   int cycle, read_beat, write_beat, kv_beat, mm_delay, wr_delay, kv_delay;
-  int pos, layer, mm_count, kv_count, coeff_reads;
+  int pos, layer, mm_count, coeff_reads;
+  logic [31:0] kv_count;
   logic reading, writing, kv_writing;
   logic [31:0] rng;
   int read_total, read_index;
@@ -134,7 +134,7 @@ module tb_t2_attention;
         end
     end else if (mm_count == 2*N_HEADS+1) begin
       want.a_base = '{rgn: RGN_SCRATCH, off: AXI_AW'(HEADS_OFF)};
-      want.b_base = offset_addr(W_BASE, D_MODEL*QKV_ELEMENTS);
+      want.b_base = offset_addr(W_BASE, D_MODEL*QKV_ELEMENTS/N_HBM);   // per-PC bytes
       want.s_base = offset_addr(S_BASE, QKV_ELEMENTS*4);
       want.c_base = OUT_BASE;
       want.k = 16'(D_MODEL);
@@ -147,12 +147,12 @@ module tb_t2_attention;
             $fatal(1, "Incorrect head concatenation at head %0d lane %0d", h, i);
         end
     end else begin
-      if (kv_count != N_KV_HEADS) $fatal(1, "Score or value GEMM before KV commits");
+      if (kv_count != 2*N_KV_HEADS) $fatal(1, "Score or value GEMM before KV commits");
       head = (mm_count-1) / 2;
       cache_head = head / (N_HEADS/N_KV_HEADS);
       pair_idx = layer*N_KV_HEADS + cache_head;
-      k_addr = '{rgn:RGN_HBM, off:KV_BASE + AXI_AW'(pair_idx*2*MAX_SEQ*HEAD_BYTES)};
-      v_addr = offset_addr(k_addr, MAX_SEQ*HEAD_BYTES);
+      k_addr = '{rgn:RGN_HBM, off:AXI_AW'(kv_pc_off(8'(layer), 4'(cache_head), 1'b0))};
+      v_addr = '{rgn:RGN_HBM, off:AXI_AW'(kv_pc_off(8'(layer), 4'(cache_head), 1'b1))};
       ks_addr = '{rgn:RGN_HBM, off:KV_SCALE_BASE + AXI_AW'(pair_idx*PAIR_SCALE_BYTES)};
       vs_addr = offset_addr(ks_addr, MAX_SEQ*4);
       want.b_is_kv = 1'b1;
@@ -180,7 +180,7 @@ module tb_t2_attention;
         want.c_base = '{rgn:RGN_SCRATCH, off:AXI_AW'(HEADS_OFF+head*HEAD_BYTES)};
         want.k = 16'(pos+1);
         want.n = 16'(HEAD_DIM);
-        want.b_row_stride = (MAX_SEQ/ARR_R)*TILE_BYTES;
+        want.b_row_stride = (MAX_SEQ/ARR_R)*(TILE_BYTES/N_HBM);   // per-PC
         want.out_fmt = OUT_I8;
         high = -32768;
         for (int i = 0; i <= pos; i++) if (score_code(head, i) > high) high = score_code(head, i);
@@ -284,18 +284,20 @@ module tb_t2_attention;
         end else write_beat <= write_beat+1;
       end
       if (kv.req_valid && kv.req_ready) begin
-        expected_kv_off = (layer*N_KV_HEADS+kv_count)*2*HEAD_BYTES*MAX_SEQ + pos*HEAD_BYTES;
-        if (kv.req !== linear_req('{rgn:RGN_HBM, off:KV_BASE+AXI_AW'(expected_kv_off)}, 2*HEAD_BEATS))
-          $fatal(1, "Wrong KV token slot for head %0d", kv_count);
+        // llm_pkg KV contract: one request per vector, base.off = kv_tag_t
+        expected_kv_off = int'(kv_tag_t'{layer: 8'(layer), kvh: 4'(kv_count/2), is_v: kv_count[0],
+                                         pos: 16'(pos)});
+        if (kv.req !== linear_req('{rgn:RGN_HBM, off:AXI_AW'(expected_kv_off)}, HEAD_BEATS))
+          $fatal(1, "Wrong KV tag for request %0d", kv_count);
         kv_writing <= 1;
         kv_beat <= 0;
       end
       if (kv.valid && kv.ready) begin
-        test_qh = N_HEADS + kv_count + (kv_beat >= HEAD_BEATS ? N_KV_HEADS : 0);
+        test_qh = N_HEADS + kv_count/2 + (kv_count[0] ? N_KV_HEADS : 0);
         for (int i = 0; i < BEAT_BYTES; i++)
-          expected_value[i*8 +: 8] = rope_oracle(test_qh, (kv_beat%HEAD_BEATS)*BEAT_BYTES+i);
+          expected_value[i*8 +: 8] = rope_oracle(test_qh, kv_beat*BEAT_BYTES+i);
         if (kv.data !== expected_value) $fatal(1, "Wrong KV payload head %0d beat %0d", kv_count, kv_beat);
-        if (kv.last != (kv_beat == 2*HEAD_BEATS-1)) $fatal(1, "Wrong kv.last");
+        if (kv.last != (kv_beat == HEAD_BEATS-1)) $fatal(1, "Wrong kv.last");
         if (kv.last) begin
           kv_writing <= 0;
           kv_delay <= 5;
@@ -335,7 +337,7 @@ module tb_t2_attention;
     cmd_valid = 0;
     cmd = '0;
     do @(negedge clk); while (!done);
-    if (mm_count != 2*N_HEADS+2 || kv_count != N_KV_HEADS || mm_delay != 0
+    if (mm_count != 2*N_HEADS+2 || kv_count != 2*N_KV_HEADS || mm_delay != 0
         || coeff_reads != (pos == 0 ? 0 : 1))
       $fatal(1, "Wrong transaction counts at completion");
     $display("PASS T2 layer %0d position %0d: %0d GEMMs and %0d KV commits",
