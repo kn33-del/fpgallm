@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Generate the Vitis RTL-kernel collateral for llm_top (32 HBM masters):
-  vitis/llm_kernel.sv   flat-port wrapper (m00_axi_* .. m31_axi_*, s_axi_control_*)
+  vitis/llm_kernel.v    flat-port wrapper (plain Verilog) (m00_axi_* .. m31_axi_*, s_axi_control_*)
   vitis/kernel.xml      kernel description (args at the ctrl_regs offsets)
   vitis/u55c.cfg        v++ connectivity: m{p}_axi -> HBM[p]
 Run after changing ports or register offsets:  python vitis/gen_kernel.py
@@ -12,73 +12,76 @@ HERE = Path(__file__).resolve().parent
 K = "llm_kernel"
 
 # ------------------------------------------------------------------------------ wrapper
+# Plain Verilog-2001 on purpose: Vivado 2022.x's IP packager (ipx::package_project) cannot
+# parse a SystemVerilog top next to llm_if.sv's struct/modport interfaces (IP_Flow 19-4824).
+def sl(name, p, w):                       # slice of a flattened [N*w] bus
+    return f"{name}[{p}]" if w == 1 else f"{name}[{p * w} +: {w}]"
+
+W = dict(araddr=64, awaddr=64, arlen=8, awlen=8, arid=6, awid=6, rid=6, bid=6, rdata=256,
+         wdata=256, wstrb=32, rresp=2, bresp=2)
 ports, body = [], []
 for p in range(N):
     m = f"m{p:02d}_axi"
+    s = lambda n: sl(n, p, W.get(n, 1))
     ports += [
-        f"  output logic         {m}_awvalid, input logic {m}_awready,",
-        f"  output logic [63:0]  {m}_awaddr,  output logic [7:0] {m}_awlen, output logic [5:0] {m}_awid,",
-        f"  output logic [2:0]   {m}_awsize,  output logic [1:0] {m}_awburst, output logic [3:0] {m}_awcache,",
-        f"  output logic [2:0]   {m}_awprot,  output logic {m}_awlock, output logic [3:0] {m}_awqos,",
-        f"  output logic         {m}_wvalid,  input logic {m}_wready, output logic [255:0] {m}_wdata,",
-        f"  output logic [31:0]  {m}_wstrb,   output logic {m}_wlast,",
-        f"  input  logic         {m}_bvalid,  output logic {m}_bready, input logic [1:0] {m}_bresp, input logic [5:0] {m}_bid,",
-        f"  output logic         {m}_arvalid, input logic {m}_arready,",
-        f"  output logic [63:0]  {m}_araddr,  output logic [7:0] {m}_arlen, output logic [5:0] {m}_arid,",
-        f"  output logic [2:0]   {m}_arsize,  output logic [1:0] {m}_arburst, output logic [3:0] {m}_arcache,",
-        f"  output logic [2:0]   {m}_arprot,  output logic {m}_arlock, output logic [3:0] {m}_arqos,",
-        f"  input  logic         {m}_rvalid,  output logic {m}_rready, input logic [255:0] {m}_rdata,",
-        f"  input  logic         {m}_rlast,   input logic [1:0] {m}_rresp, input logic [5:0] {m}_rid,",
+        f"  output wire         {m}_awvalid, input wire {m}_awready,",
+        f"  output wire [63:0]  {m}_awaddr,  output wire [7:0] {m}_awlen, output wire [5:0] {m}_awid,",
+        f"  output wire [2:0]   {m}_awsize,  output wire [1:0] {m}_awburst, output wire [3:0] {m}_awcache,",
+        f"  output wire [2:0]   {m}_awprot,  output wire {m}_awlock, output wire [3:0] {m}_awqos,",
+        f"  output wire         {m}_wvalid,  input wire {m}_wready, output wire [255:0] {m}_wdata,",
+        f"  output wire [31:0]  {m}_wstrb,   output wire {m}_wlast,",
+        f"  input  wire         {m}_bvalid,  output wire {m}_bready, input wire [1:0] {m}_bresp, input wire [5:0] {m}_bid,",
+        f"  output wire         {m}_arvalid, input wire {m}_arready,",
+        f"  output wire [63:0]  {m}_araddr,  output wire [7:0] {m}_arlen, output wire [5:0] {m}_arid,",
+        f"  output wire [2:0]   {m}_arsize,  output wire [1:0] {m}_arburst, output wire [3:0] {m}_arcache,",
+        f"  output wire [2:0]   {m}_arprot,  output wire {m}_arlock, output wire [3:0] {m}_arqos,",
+        f"  input  wire         {m}_rvalid,  output wire {m}_rready, input wire [255:0] {m}_rdata,",
+        f"  input  wire         {m}_rlast,   input wire [1:0] {m}_rresp, input wire [5:0] {m}_rid,",
     ]
     body += [
-        f"  assign {m}_awvalid = awvalid[{p}]; assign awready[{p}] = {m}_awready;",
-        f"  assign {m}_awaddr = awaddr[{p}]; assign {m}_awlen = awlen[{p}]; assign {m}_awid = awid[{p}];",
+        f"  assign {m}_awvalid = {s('awvalid')}; assign {s('awready')} = {m}_awready;",
+        f"  assign {m}_awaddr = {s('awaddr')}; assign {m}_awlen = {s('awlen')}; assign {m}_awid = {s('awid')};",
         f"  assign {m}_awsize = 3'd5; assign {m}_awburst = 2'b01; assign {m}_awcache = 4'b0011;",
-        f"  assign {m}_awprot = '0; assign {m}_awlock = 1'b0; assign {m}_awqos = '0;",
-        f"  assign {m}_wvalid = wvalid[{p}]; assign wready[{p}] = {m}_wready; assign {m}_wdata = wdata[{p}];",
-        f"  assign {m}_wstrb = wstrb[{p}]; assign {m}_wlast = wlast[{p}];",
-        f"  assign bvalid[{p}] = {m}_bvalid; assign {m}_bready = bready[{p}]; assign bresp[{p}] = {m}_bresp; assign bid[{p}] = {m}_bid;",
-        f"  assign {m}_arvalid = arvalid[{p}]; assign arready[{p}] = {m}_arready;",
-        f"  assign {m}_araddr = araddr[{p}]; assign {m}_arlen = arlen[{p}]; assign {m}_arid = arid[{p}];",
+        f"  assign {m}_awprot = 3'd0; assign {m}_awlock = 1'b0; assign {m}_awqos = 4'd0;",
+        f"  assign {m}_wvalid = {s('wvalid')}; assign {s('wready')} = {m}_wready; assign {m}_wdata = {s('wdata')};",
+        f"  assign {m}_wstrb = {s('wstrb')}; assign {m}_wlast = {s('wlast')};",
+        f"  assign {s('bvalid')} = {m}_bvalid; assign {m}_bready = {s('bready')}; assign {s('bresp')} = {m}_bresp; assign {s('bid')} = {m}_bid;",
+        f"  assign {m}_arvalid = {s('arvalid')}; assign {s('arready')} = {m}_arready;",
+        f"  assign {m}_araddr = {s('araddr')}; assign {m}_arlen = {s('arlen')}; assign {m}_arid = {s('arid')};",
         f"  assign {m}_arsize = 3'd5; assign {m}_arburst = 2'b01; assign {m}_arcache = 4'b0011;",
-        f"  assign {m}_arprot = '0; assign {m}_arlock = 1'b0; assign {m}_arqos = '0;",
-        f"  assign rvalid[{p}] = {m}_rvalid; assign {m}_rready = rready[{p}]; assign rdata[{p}] = {m}_rdata;",
-        f"  assign rlast[{p}] = {m}_rlast; assign rresp[{p}] = {m}_rresp; assign rid[{p}] = {m}_rid;",
+        f"  assign {m}_arprot = 3'd0; assign {m}_arlock = 1'b0; assign {m}_arqos = 4'd0;",
+        f"  assign {s('rvalid')} = {m}_rvalid; assign {m}_rready = {s('rready')}; assign {s('rdata')} = {m}_rdata;",
+        f"  assign {s('rlast')} = {m}_rlast; assign {s('rresp')} = {m}_rresp; assign {s('rid')} = {m}_rid;",
     ]
 ports[-1] = ports[-1].rstrip(",")
-sv = f"""// GENERATED by vitis/gen_kernel.py -- do not edit. Vitis RTL kernel top for llm_top.
+sc = ["awaddr", "awvalid", "awready", "wdata", "wstrb", "wvalid", "wready", "bresp", "bvalid", "bready",
+      "araddr", "arvalid", "arready", "rdata", "rresp", "rvalid", "rready"]
+ctl = ",\n".join(f"    .s_axi_control_{n} (s_axi_control_{n})" for n in sc)
+wires = "\n".join(f"  wire [{N * w - 1}:0] {n};" for n, w in W.items())
+wires += "\n  wire [{0}:0] arvalid, arready, rvalid, rready, rlast, awvalid, awready, wvalid, wready, wlast, bvalid, bready;".format(N - 1)
+v = f"""// GENERATED by vitis/gen_kernel.py -- do not edit. Vitis RTL kernel top for llm_top.
 // Flattens llm_top's packed [N_HBM] AXI arrays into m00_axi..m31_axi so Vivado/Vitis infer
 // 32 independent AXI4 masters. Fixed AXI fields: 32-B beats, INCR bursts, modifiable/bufferable.
+// Plain Verilog so the Vivado IP packager can parse it (llm_top below it stays SystemVerilog).
 module {K} (
-  input  logic ap_clk,
-  input  logic ap_rst_n,
-  input  logic [11:0] s_axi_control_awaddr,  input  logic s_axi_control_awvalid, output logic s_axi_control_awready,
-  input  logic [31:0] s_axi_control_wdata,   input  logic [3:0] s_axi_control_wstrb,
-  input  logic        s_axi_control_wvalid,  output logic s_axi_control_wready,
-  output logic [1:0]  s_axi_control_bresp,   output logic s_axi_control_bvalid,  input logic s_axi_control_bready,
-  input  logic [11:0] s_axi_control_araddr,  input  logic s_axi_control_arvalid, output logic s_axi_control_arready,
-  output logic [31:0] s_axi_control_rdata,   output logic [1:0] s_axi_control_rresp,
-  output logic        s_axi_control_rvalid,  input  logic s_axi_control_rready,
-  output logic        interrupt,
+  input  wire ap_clk,
+  input  wire ap_rst_n,
+  input  wire [11:0] s_axi_control_awaddr,  input  wire s_axi_control_awvalid, output wire s_axi_control_awready,
+  input  wire [31:0] s_axi_control_wdata,   input  wire [3:0] s_axi_control_wstrb,
+  input  wire        s_axi_control_wvalid,  output wire s_axi_control_wready,
+  output wire [1:0]  s_axi_control_bresp,   output wire s_axi_control_bvalid,  input wire s_axi_control_bready,
+  input  wire [11:0] s_axi_control_araddr,  input  wire s_axi_control_arvalid, output wire s_axi_control_arready,
+  output wire [31:0] s_axi_control_rdata,   output wire [1:0] s_axi_control_rresp,
+  output wire        s_axi_control_rvalid,  input  wire s_axi_control_rready,
+  output wire        interrupt,
 {chr(10).join(ports)}
 );
-  logic [{N-1}:0][63:0]  araddr, awaddr;
-  logic [{N-1}:0][7:0]   arlen, awlen;
-  logic [{N-1}:0][5:0]   arid, awid, rid, bid;
-  logic [{N-1}:0]        arvalid, arready, rvalid, rready, rlast, awvalid, awready;
-  logic [{N-1}:0]        wvalid, wready, wlast, bvalid, bready;
-  logic [{N-1}:0][255:0] rdata, wdata;
-  logic [{N-1}:0][31:0]  wstrb;
-  logic [{N-1}:0][1:0]   rresp, bresp;
+{wires}
 
   llm_top u_top (
-    .ap_clk, .ap_rst_n,
-    .s_axi_control_awaddr, .s_axi_control_awvalid, .s_axi_control_awready,
-    .s_axi_control_wdata, .s_axi_control_wstrb, .s_axi_control_wvalid, .s_axi_control_wready,
-    .s_axi_control_bresp, .s_axi_control_bvalid, .s_axi_control_bready,
-    .s_axi_control_araddr, .s_axi_control_arvalid, .s_axi_control_arready,
-    .s_axi_control_rdata, .s_axi_control_rresp, .s_axi_control_rvalid, .s_axi_control_rready,
-    .interrupt,
+    .ap_clk (ap_clk), .ap_rst_n (ap_rst_n),
+{ctl},
+    .interrupt (interrupt),
     .m_axi_araddr (araddr), .m_axi_arlen (arlen), .m_axi_arid (arid), .m_axi_arvalid (arvalid),
     .m_axi_arready (arready), .m_axi_rdata (rdata), .m_axi_rid (rid), .m_axi_rresp (rresp),
     .m_axi_rlast (rlast), .m_axi_rvalid (rvalid), .m_axi_rready (rready),
@@ -91,8 +94,10 @@ module {K} (
 {chr(10).join(body)}
 endmodule
 """
-(HERE / f"{K}.sv").write_text(sv)
-
+(HERE / f"{K}.v").write_text(v)
+old = HERE / f"{K}.sv"
+if old.exists():
+    old.unlink()
 # ------------------------------------------------------------------------------ kernel.xml
 scalars = [("instr_base", 0x10, 8, "ulong"), ("n_instr", 0x18, 4, "uint"), ("token_pos", 0x1C, 4, "uint"),
            ("result_token", 0x20, 4, "uint"), ("token_in", 0x24, 4, "uint")]
@@ -124,4 +129,4 @@ cfg = ["# GENERATED by vitis/gen_kernel.py", "[connectivity]", f"nk={K}:1:{K}_1"
 cfg += [f"sp={K}_1.m{p:02d}_axi:HBM[{p}]" for p in range(N)]
 cfg += ["", "[vivado]", "prop=run.impl_1.STRATEGY=Performance_Explore"]
 (HERE / "u55c.cfg").write_text("\n".join(cfg) + "\n")
-print("wrote", K + ".sv", "kernel.xml", "u55c.cfg")
+print("wrote", K + ".v", "kernel.xml", "u55c.cfg")
